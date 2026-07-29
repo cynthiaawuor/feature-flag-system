@@ -20,3 +20,13 @@ export class FlagNotFoundError extends AppError {
     super(404, "FLAG_NOT_FOUND", `No flag with key "${key}" exists.`);
   }
 }
+
+export class FlagConfigWriteError extends AppError {
+  constructor(action: "create" | "update", flagId: string, environment: string) {
+    super(
+      500,
+      "FLAG_CONFIG_WRITE_FAILED",
+      `Failed to ${action} the configuration for flag "${flagId}" in environment "${environment}".`,
+    );
+  }
+}

@@ -1,9 +1,10 @@
 import { Router } from "express";
 import * as flagService from "../services/flagService.js";
+import { requireEnvironment } from "../midlleware/requireEnvironment.js";
 
 export const evaluateRouter = Router();
 
-evaluateRouter.get("/", async (req, res) => {
+evaluateRouter.get("/", requireEnvironment, async (req, res) => {
   const { flag, user } = req.query;
 
   if (typeof flag !== "string" || flag.trim() === "") {
@@ -18,6 +19,6 @@ evaluateRouter.get("/", async (req, res) => {
     });
   }
 
-  const result = await flagService.evaluate(flag, user);
+  const result = await flagService.evaluate(flag, req.environment!, user);
   return res.json(result);
 });
