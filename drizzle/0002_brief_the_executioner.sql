@@ -1,0 +1,1 @@
+ALTER TABLE "flags" ADD COLUMN "rollout_percentage" integer;

@@ -1,4 +1,11 @@
-import { pgTable, uuid, text, boolean, timestamp } from "drizzle-orm/pg-core";
+import {
+  pgTable,
+  uuid,
+  text,
+  boolean,
+  timestamp,
+  integer,
+} from "drizzle-orm/pg-core";
 
 export const flags = pgTable("flags", {
   id: uuid("id").defaultRandom().primaryKey(),
@@ -13,4 +20,6 @@ export const flags = pgTable("flags", {
   updatedAt: timestamp("updated_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
+  targetedUserIds: text("targeted_user_ids").array().notNull().default([]),
+  rolloutPercentage: integer("rollout_percentage"),
 });

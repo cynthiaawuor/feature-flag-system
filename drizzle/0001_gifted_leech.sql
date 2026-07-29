@@ -1,0 +1,1 @@
+ALTER TABLE "flags" ADD COLUMN "targeted_user_ids" text[] DEFAULT '{}' NOT NULL;

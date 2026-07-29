@@ -2,6 +2,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { flags } from "../db/schema.js";
 import { DuplicateFlagKeyError, FlagNotFoundError } from "./errors.js";
+import { bucketForUser } from "./hash.js";
 
 export interface CreateFlagInput {
   key: string;
@@ -71,6 +72,7 @@ export const setEnabled = async (
 
 export const evaluate = async (flagKey: string, userId: string) => {
   const [flag] = await db.select().from(flags).where(eq(flags.key, flagKey));
+
   if (!flag) {
     return {
       flagKey,
@@ -79,6 +81,9 @@ export const evaluate = async (flagKey: string, userId: string) => {
       reason: "Flag not found",
     };
   }
+  /**
+   * Flag off in the evaluated environment → off. Targeting and rollout are never consulted.
+   */
   if (!flag.enabled) {
     return {
       flagKey,
@@ -87,4 +92,109 @@ export const evaluate = async (flagKey: string, userId: string) => {
       reason: "Flag not enabled",
     };
   }
+  /**
+   * Flag on and the user is targeted → on.
+   */
+  if (flag.targetedUserIds.includes(userId)) {
+    return {
+      flagKey,
+      userId,
+      decision: "on",
+      reason: "user_targeted",
+    };
+  }
+  /**
+   * Flag on and a percentage rollout is configured → the hash decides
+   */
+  if (flag.rolloutPercentage !== null) {
+    const bucket = bucketForUser(userId, flagKey);
+    if (bucket < flag.rolloutPercentage) {
+      return {
+        flagKey,
+        userId,
+        decision: "on",
+        reason: "rollout_included",
+      };
+    }
+    return {
+      flagKey,
+      userId,
+      decision: "off",
+      reason: "rollout_excluded",
+    };
+  }
+  /**
+   * Flag on with no rollout configured → on for everyone
+   */
+
+  return {
+    flagKey,
+    userId,
+    decision: "on",
+    reason: "flag_enabled_no_rules",
+  };
 };
+
+export const addTarget = async (key: string, userId: string, actor: string) => {
+  const [flag] = await getFlagByKey(key);
+
+  if (!flag) {
+    throw new FlagNotFoundError(key);
+  }
+
+  if (flag.targetedUserIds.includes(userId)) {
+    return flag;
+  }
+
+  const [updated] = await db
+    .update(flags)
+    .set({
+      targetedUserIds: [...flag.targetedUserIds, userId],
+      updatedBy: actor,
+      updatedAt: new Date(),
+    })
+    .where(eq(flags.key, key))
+    .returning();
+  return updated;
+};
+
+export const removeTarget = async (
+  key: string,
+  userId: string,
+  actor: string,
+) => {
+  const [flag] = await getFlagByKey(key);
+
+  if (!flag) {
+    throw new FlagNotFoundError(key);
+  }
+
+  const [updated] = await db
+    .update(flags)
+    .set({
+      targetedUserIds: flag.targetedUserIds.filter((id) => id !== userId),
+      updatedBy: actor,
+      updatedAt: new Date(),
+    })
+    .returning();
+
+  return updated;
+};
+
+export async function setRollout(
+  key: string,
+  percentage: number,
+  actor: string,
+) {
+  await getFlagByKey(key);
+  const [updated] = await db
+    .update(flags)
+    .set({
+      rolloutPercentage: percentage,
+      updatedBy: actor,
+      updatedAt: new Date(),
+    })
+    .where(eq(flags.key, key))
+    .returning();
+  return updated;
+}
