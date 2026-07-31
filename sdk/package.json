@@ -1,0 +1,20 @@
+{
+  "name": "feature-flag-sdk",
+  "version": "0.1.0",
+  "description": "Client SDK for the feature flag service",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
