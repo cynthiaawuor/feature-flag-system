@@ -7,6 +7,7 @@ import {
   timestamp,
   integer,
   unique,
+  jsonb,
 } from "drizzle-orm/pg-core";
 
 export const flags = pgTable("flags", {
@@ -45,3 +46,24 @@ export const flagEnvironmentConfigs = pgTable(
   },
   (table) => [unique().on(table.flagId, table.environment)],
 );
+
+/**
+ * Append-only. Every change to a flag or its environment config gets a row
+ * here; nothing about this table is ever updated or deleted, only inserted.
+ * `environment` is null for changes that aren't environment-scoped (creating
+ * the flag itself).
+ */
+export const flagHistory = pgTable("flag_history", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  flagId: uuid("flag_id")
+    .notNull()
+    .references(() => flags.id, { onDelete: "cascade" }),
+  environment: text("environment"),
+  field: text("field").notNull(),
+  previousValue: jsonb("previous_value"),
+  newValue: jsonb("new_value"),
+  actor: text("actor").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});

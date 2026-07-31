@@ -1,6 +1,6 @@
-import { and, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import { db } from "../db/client.js";
-import { flags, flagEnvironmentConfigs } from "../db/schema.js";
+import { flags, flagEnvironmentConfigs, flagHistory } from "../db/schema.js";
 import {
   DuplicateFlagKeyError,
   FlagConfigWriteError,
@@ -16,15 +16,30 @@ export interface CreateFlagInput {
 
 export const createFlag = async (input: CreateFlagInput) => {
   try {
-    const [flag] = await db
-      .insert(flags)
-      .values({
-        key: input.key,
-        description: input.description,
-        createdBy: input.actor,
-      })
-      .returning();
-    return flag;
+    return await db.transaction(async (tx) => {
+      const [flag] = await tx
+        .insert(flags)
+        .values({
+          key: input.key,
+          description: input.description,
+          createdBy: input.actor,
+        })
+        .returning();
+      if (!flag) {
+        throw new FlagConfigWriteError("create", input.key, "n/a");
+      }
+
+      await tx.insert(flagHistory).values({
+        flagId: flag.id,
+        environment: null,
+        field: "created",
+        previousValue: null,
+        newValue: { key: flag.key, description: flag.description },
+        actor: input.actor,
+      });
+
+      return flag;
+    });
   } catch (error: any) {
     /**
      * POSTGRESQL UNIQUE() violation returns code '23505'
@@ -48,6 +63,22 @@ export const getFlagByKey = async (key: string) => {
   return flag;
 };
 
+export const getFlagHistory = async (key: string) => {
+  const flag = await getFlagByKey(key);
+  return await db
+    .select({
+      environment: flagHistory.environment,
+      field: flagHistory.field,
+      previousValue: flagHistory.previousValue,
+      newValue: flagHistory.newValue,
+      actor: flagHistory.actor,
+      createdAt: flagHistory.createdAt,
+    })
+    .from(flagHistory)
+    .where(eq(flagHistory.flagId, flag.id))
+    .orderBy(asc(flagHistory.createdAt));
+};
+
 const getConfig = async (flagId: string, environment: string) => {
   const [config] = await db
     .select()
@@ -59,31 +90,6 @@ const getConfig = async (flagId: string, environment: string) => {
       ),
     );
   return config;
-};
-
-/**
- * A flag has no config row for an environment until someone configures it
- * there for the first time. Mutations create that row on demand, so any
- * environment name works with no separate "register an environment" step.
- */
-const getOrCreateConfig = async (
-  flagId: string,
-  environment: string,
-  actor: string,
-) => {
-  const existing = await getConfig(flagId, environment);
-  if (existing) {
-    return existing;
-  }
-
-  const [created] = await db
-    .insert(flagEnvironmentConfigs)
-    .values({ flagId, environment, updatedBy: actor })
-    .returning();
-  if (!created) {
-    throw new FlagConfigWriteError("create", flagId, environment);
-  }
-  return created;
 };
 
 const toView = (
@@ -121,23 +127,50 @@ export const setEnabled = async (
   enabled: boolean,
 ) => {
   const flag = await getFlagByKey(key);
-  await getOrCreateConfig(flag.id, environment, actor);
 
-  const [updated] = await db
-    .update(flagEnvironmentConfigs)
-    .set({ enabled, updatedBy: actor, updatedAt: new Date() })
-    .where(
-      and(
-        eq(flagEnvironmentConfigs.flagId, flag.id),
-        eq(flagEnvironmentConfigs.environment, environment),
-      ),
-    )
-    .returning();
-  if (!updated) {
-    throw new FlagConfigWriteError("update", flag.id, environment);
-  }
+  return await db.transaction(async (tx) => {
+    let [before] = await tx
+      .select()
+      .from(flagEnvironmentConfigs)
+      .where(
+        and(
+          eq(flagEnvironmentConfigs.flagId, flag.id),
+          eq(flagEnvironmentConfigs.environment, environment),
+        ),
+      );
+    if (!before) {
+      const [created] = await tx
+        .insert(flagEnvironmentConfigs)
+        .values({ flagId: flag.id, environment, updatedBy: actor })
+        .returning();
+      if (!created) {
+        throw new FlagConfigWriteError("create", flag.id, environment);
+      }
+      before = created;
+    }
 
-  return toView(flag, updated);
+    const [updated] = await tx
+      .update(flagEnvironmentConfigs)
+      .set({ enabled, updatedBy: actor, updatedAt: new Date() })
+      .where(eq(flagEnvironmentConfigs.id, before.id))
+      .returning();
+    if (!updated) {
+      throw new FlagConfigWriteError("update", flag.id, environment);
+    }
+
+    if (before.enabled !== enabled) {
+      await tx.insert(flagHistory).values({
+        flagId: flag.id,
+        environment,
+        field: "enabled",
+        previousValue: before.enabled,
+        newValue: enabled,
+        actor,
+      });
+    }
+
+    return toView(flag, updated);
+  });
 };
 
 export const evaluate = async (
@@ -225,26 +258,57 @@ export const addTarget = async (
   actor: string,
 ) => {
   const flag = await getFlagByKey(key);
-  const config = await getOrCreateConfig(flag.id, environment, actor);
 
-  if (config.targetedUserIds.includes(userId)) {
-    return toView(flag, config);
-  }
+  return await db.transaction(async (tx) => {
+    let [before] = await tx
+      .select()
+      .from(flagEnvironmentConfigs)
+      .where(
+        and(
+          eq(flagEnvironmentConfigs.flagId, flag.id),
+          eq(flagEnvironmentConfigs.environment, environment),
+        ),
+      );
+    if (!before) {
+      const [created] = await tx
+        .insert(flagEnvironmentConfigs)
+        .values({ flagId: flag.id, environment, updatedBy: actor })
+        .returning();
+      if (!created) {
+        throw new FlagConfigWriteError("create", flag.id, environment);
+      }
+      before = created;
+    }
 
-  const [updated] = await db
-    .update(flagEnvironmentConfigs)
-    .set({
-      targetedUserIds: [...config.targetedUserIds, userId],
-      updatedBy: actor,
-      updatedAt: new Date(),
-    })
-    .where(eq(flagEnvironmentConfigs.id, config.id))
-    .returning();
-  if (!updated) {
-    throw new FlagConfigWriteError("update", flag.id, environment);
-  }
+    if (before.targetedUserIds.includes(userId)) {
+      return toView(flag, before);
+    }
 
-  return toView(flag, updated);
+    const after = [...before.targetedUserIds, userId];
+    const [updated] = await tx
+      .update(flagEnvironmentConfigs)
+      .set({
+        targetedUserIds: after,
+        updatedBy: actor,
+        updatedAt: new Date(),
+      })
+      .where(eq(flagEnvironmentConfigs.id, before.id))
+      .returning();
+    if (!updated) {
+      throw new FlagConfigWriteError("update", flag.id, environment);
+    }
+
+    await tx.insert(flagHistory).values({
+      flagId: flag.id,
+      environment,
+      field: "targetedUserIds",
+      previousValue: before.targetedUserIds,
+      newValue: after,
+      actor,
+    });
+
+    return toView(flag, updated);
+  });
 };
 
 export const removeTarget = async (
@@ -254,22 +318,57 @@ export const removeTarget = async (
   actor: string,
 ) => {
   const flag = await getFlagByKey(key);
-  const config = await getOrCreateConfig(flag.id, environment, actor);
 
-  const [updated] = await db
-    .update(flagEnvironmentConfigs)
-    .set({
-      targetedUserIds: config.targetedUserIds.filter((id) => id !== userId),
-      updatedBy: actor,
-      updatedAt: new Date(),
-    })
-    .where(eq(flagEnvironmentConfigs.id, config.id))
-    .returning();
-  if (!updated) {
-    throw new FlagConfigWriteError("update", flag.id, environment);
-  }
+  return await db.transaction(async (tx) => {
+    let [before] = await tx
+      .select()
+      .from(flagEnvironmentConfigs)
+      .where(
+        and(
+          eq(flagEnvironmentConfigs.flagId, flag.id),
+          eq(flagEnvironmentConfigs.environment, environment),
+        ),
+      );
+    if (!before) {
+      const [created] = await tx
+        .insert(flagEnvironmentConfigs)
+        .values({ flagId: flag.id, environment, updatedBy: actor })
+        .returning();
+      if (!created) {
+        throw new FlagConfigWriteError("create", flag.id, environment);
+      }
+      before = created;
+    }
 
-  return toView(flag, updated);
+    if (!before.targetedUserIds.includes(userId)) {
+      return toView(flag, before);
+    }
+
+    const after = before.targetedUserIds.filter((id) => id !== userId);
+    const [updated] = await tx
+      .update(flagEnvironmentConfigs)
+      .set({
+        targetedUserIds: after,
+        updatedBy: actor,
+        updatedAt: new Date(),
+      })
+      .where(eq(flagEnvironmentConfigs.id, before.id))
+      .returning();
+    if (!updated) {
+      throw new FlagConfigWriteError("update", flag.id, environment);
+    }
+
+    await tx.insert(flagHistory).values({
+      flagId: flag.id,
+      environment,
+      field: "targetedUserIds",
+      previousValue: before.targetedUserIds,
+      newValue: after,
+      actor,
+    });
+
+    return toView(flag, updated);
+  });
 };
 
 export const setRollout = async (
@@ -279,20 +378,52 @@ export const setRollout = async (
   actor: string,
 ) => {
   const flag = await getFlagByKey(key);
-  const config = await getOrCreateConfig(flag.id, environment, actor);
 
-  const [updated] = await db
-    .update(flagEnvironmentConfigs)
-    .set({
-      rolloutPercentage: percentage,
-      updatedBy: actor,
-      updatedAt: new Date(),
-    })
-    .where(eq(flagEnvironmentConfigs.id, config.id))
-    .returning();
-  if (!updated) {
-    throw new FlagConfigWriteError("update", flag.id, environment);
-  }
+  return await db.transaction(async (tx) => {
+    let [before] = await tx
+      .select()
+      .from(flagEnvironmentConfigs)
+      .where(
+        and(
+          eq(flagEnvironmentConfigs.flagId, flag.id),
+          eq(flagEnvironmentConfigs.environment, environment),
+        ),
+      );
+    if (!before) {
+      const [created] = await tx
+        .insert(flagEnvironmentConfigs)
+        .values({ flagId: flag.id, environment, updatedBy: actor })
+        .returning();
+      if (!created) {
+        throw new FlagConfigWriteError("create", flag.id, environment);
+      }
+      before = created;
+    }
 
-  return toView(flag, updated);
+    const [updated] = await tx
+      .update(flagEnvironmentConfigs)
+      .set({
+        rolloutPercentage: percentage,
+        updatedBy: actor,
+        updatedAt: new Date(),
+      })
+      .where(eq(flagEnvironmentConfigs.id, before.id))
+      .returning();
+    if (!updated) {
+      throw new FlagConfigWriteError("update", flag.id, environment);
+    }
+
+    if (before.rolloutPercentage !== percentage) {
+      await tx.insert(flagHistory).values({
+        flagId: flag.id,
+        environment,
+        field: "rolloutPercentage",
+        previousValue: before.rolloutPercentage,
+        newValue: percentage,
+        actor,
+      });
+    }
+
+    return toView(flag, updated);
+  });
 };

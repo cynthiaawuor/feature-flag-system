@@ -37,6 +37,19 @@ flagsRouter.get("/:key", requireEnvironment, async (req, res) => {
   return res.json(flag);
 });
 
+flagsRouter.get("/:key/history", async (req, res) => {
+  const { key } = req.params;
+  const keyParam = Array.isArray(key) ? key[0] : key;
+  if (!keyParam) {
+    return res.status(400).json({
+      error: { message: "Missing key" },
+    });
+  }
+
+  const history = await flagService.getFlagHistory(keyParam);
+  return res.json(history);
+});
+
 flagsRouter.patch(
   "/:key",
   requireActor,

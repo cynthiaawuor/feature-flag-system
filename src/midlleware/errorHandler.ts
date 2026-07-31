@@ -12,7 +12,6 @@ export const errorHandler = (
       error: { code: err.code, message: err.message },
     });
   }
-  console.error("Unexpected error:", err);
   return res.status(500).json({
     error: { code: "INTERNAL_ERROR", message: "Something went wrong" },
   });
